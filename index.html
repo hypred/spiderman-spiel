@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Spider-Swing</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f24; font-family: system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H;
+const resize = () => { W = cv.width = innerWidth; H = cv.height = innerHeight; };
+addEventListener('resize', resize); resize();
+
+const GRAV = 0.45, ROPE_MAX = 560, PW = 22, PH = 38;
+let state = 'menu', best = +localStorage.spiderBest || 0;
+let p, rope, buildings, drones, tokens, particles, cam, genX, score, bonus, lives, inv, mouse = { x: 0, y: 0 };
+const keys = {};
+
+// Deterministischer Zufall pro Gebäude (für Fenster)
+const rnd = (a, b) => a + Math.random() * (b - a);
+const hash = n => { n = Math.sin(n * 127.1) * 43758.5453; return n - Math.floor(n); };
+
+function reset() {
+  p = { x: 120, y: -460, vx: 4, vy: 0, onGround: false, face: 1, rot: 0 };
+  rope = null; buildings = []; drones = []; tokens = []; particles = [];
+  cam = { x: 0, y: -H * 0.6 }; genX = -200; score = 0; bonus = 0; lives = 3; inv = 0;
+  buildings.push({ x: -200, w: 500, h: 420, seed: 1 });
+  genX = 300;
+  generate();
+}
+
+function generate() {
+  while (genX < cam.x + W + 800) {
+    genX += rnd(70, 220);
+    const w = rnd(140, 300), h = rnd(260, 720);
+    buildings.push({ x: genX, w, h, seed: Math.random() * 1000 });
+    if (Math.random() < 0.55) tokens.push({ x: genX + rnd(-60, w), y: -h - rnd(80, 320), t: Math.random() * 6 });
+    if (Math.random() < 0.35 + Math.min(score / 20000, 0.35))
+      drones.push({ x: genX + rnd(0, w), y: -rnd(250, 900), base: 0, t: Math.random() * 6, vx: -rnd(0.5, 1.8) });
+    genX += w;
+  }
+  drones.forEach(d => d.base ||= d.y);
+  const left = cam.x - 600;
+  buildings = buildings.filter(b => b.x + b.w > left);
+  tokens = tokens.filter(t => t.x > left && !t.got);
+  drones = drones.filter(d => d.x > left && !d.dead);
+}
+
+// Strahl gegen Gebäude-Rechtecke (Slab-Methode)
+function raycast(ox, oy, dx, dy) {
+  let best = null;
+  for (const b of buildings) {
+    const x0 = b.x, x1 = b.x + b.w, y0 = -b.h, y1 = 0;
+    let tmin = 0, tmax = ROPE_MAX;
+    for (const [o, d, lo, hi] of [[ox, dx, x0, x1], [oy, dy, y0, y1]]) {
+      if (Math.abs(d) < 1e-6) { if (o < lo || o > hi) { tmin = Infinity; break; } continue; }
+      let t1 = (lo - o) / d, t2 = (hi - o) / d;
+      if (t1 > t2) [t1, t2] = [t2, t1];
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    if (tmin <= tmax && tmin > 0 && (!best || tmin < best.t)) best = { t: tmin };
+  }
+  return best && { x: ox + dx * best.t, y: oy + dy * best.t };
+}
+
+function shootWeb(tx, ty) {
+  if (state !== 'play') return;
+  let dx = tx - p.x, dy = ty - p.y;
+  const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
+  const hit = raycast(p.x, p.y, dx, dy);
+  if (hit && hit.y < p.y + 10) {
+    rope = { x: hit.x, y: hit.y, len: Math.hypot(hit.x - p.x, hit.y - p.y) };
+    p.onGround = false;
+  } else {
+    rope = null;
+    // Fehlschuss-Effekt
+    for (let i = 0; i < 6; i++) particles.push({ x: p.x + dx * 60 * i, y: p.y + dy * 60 * i, vx: 0, vy: 0, life: 12, c: '#ddd' });
+  }
+}
+const autoWeb = () => shootWeb(p.x + p.face * 0.75 * 300, p.y - 300); // ~53° nach vorne oben
+
+function hurt() {
+  if (inv > 0) return;
+  lives--; inv = 90; rope = null; p.vy = -6;
+  burst(p.x, p.y, '#ff3b3b', 20);
+  if (lives <= 0) { state = 'over'; best = Math.max(best, total()); localStorage.spiderBest = best; }
+}
+const total = () => Math.floor(score / 10) + bonus;
+const burst = (x, y, c, n) => { for (let i = 0; i < n; i++) particles.push({ x, y, vx: rnd(-5, 5), vy: rnd(-6, 3), life: rnd(20, 45), c }); };
+
+function update() {
+  if (state !== 'play') return;
+  const ax = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+  if (ax) p.face = ax;
+
+  if (p.onGround) {
+    p.vx += ax * 0.9; p.vx *= 0.85;
+    if (keys.KeyW || keys.ArrowUp) { p.vy = -11; p.onGround = false; }
+  } else {
+    p.vx += ax * (rope ? 0.18 : 0.08); // Schwung holen
+    p.vx *= 0.998;
+  }
+  p.vy += GRAV;
+  if (rope && (keys.KeyS || keys.ArrowDown)) rope.len = Math.min(ROPE_MAX, rope.len + 4);
+  if (rope && (keys.KeyW || keys.ArrowUp) && !p.onGround) rope.len = Math.max(40, rope.len - 5);
+  p.x += p.vx; p.y += p.vy;
+
+  // Seil als Zugbedingung (kein Stab): nur bei Überdehnung korrigieren
+  if (rope) {
+    const dx = p.x - rope.x, dy = p.y - rope.y, d = Math.hypot(dx, dy);
+    if (d > rope.len) {
+      const nx = dx / d, ny = dy / d;
+      p.x = rope.x + nx * rope.len; p.y = rope.y + ny * rope.len;
+      const radial = p.vx * nx + p.vy * ny;
+      if (radial > 0) { p.vx -= radial * nx; p.vy -= radial * ny; }
+    }
+  }
+
+  // Kollision mit Gebäuden und Straße
+  p.onGround = false;
+  for (const b of buildings) {
+    const ox = Math.min(p.x + PW / 2, b.x + b.w) - Math.max(p.x - PW / 2, b.x);
+    const oy = Math.min(p.y + PH / 2, 0) - Math.max(p.y - PH / 2, -b.h);
+    if (ox > 0 && oy > 0) {
+      if (oy < ox) { p.y -= oy; if (p.vy > 0) p.vy = 0; p.onGround = true; } // Dach
+      else { // Wand: klettern, wenn man auf sie zu drückt, sonst langsam rutschen
+        const dir = p.x < b.x + b.w / 2 ? 1 : -1;
+        p.x -= dir * ox; p.vx = 0;
+        if (keys.KeyW || keys.ArrowUp) { p.vy = -10; p.vx = -dir * 6; rope = null; } // Wandsprung
+        else p.vy = ax === dir ? -4 : Math.min(p.vy, 2);
+        if (ax === dir) p.vx = dir * 0.5; // an der Wand haften
+      }
+    }
+  }
+  if (p.y > -PH / 2) { p.y = -PH / 2; p.vy = 0; p.onGround = true; }
+  if (p.onGround && rope && rope.y > p.y - 30) rope = null;
+
+  const speed = Math.hypot(p.vx, p.vy);
+  p.rot += ((p.onGround ? 0 : Math.atan2(p.vy, Math.abs(p.vx) + 4) * 0.6 * Math.sign(p.vx || 1)) - p.rot) * 0.15;
+  score = Math.max(score, p.x);
+
+  for (const t of tokens) {
+    t.t += 0.08;
+    if (!t.got && Math.hypot(t.x - p.x, t.y - p.y) < 30) { t.got = true; bonus += 50; burst(t.x, t.y, '#ffd84a', 14); }
+  }
+  for (const d of drones) {
+    d.t += 0.04; d.x += d.vx; d.y = d.base + Math.sin(d.t) * 40;
+    if (!d.dead && Math.abs(d.x - p.x) < 30 && Math.abs(d.y - p.y) < 30) {
+      if (speed > 9 || p.vy > 4) { d.dead = true; bonus += 100; p.vy = -8; burst(d.x, d.y, '#5cf', 24); }
+      else hurt();
+    }
+  }
+  if (inv > 0) inv--;
+  particles.forEach(q => { q.x += q.vx; q.y += q.vy; q.vy += 0.2; q.life--; });
+  particles = particles.filter(q => q.life > 0);
+
+  cam.x += (p.x - W * 0.35 - cam.x) * 0.12;
+  cam.y += (Math.min(p.y - H * 0.5, 40 - H) - cam.y) * 0.08;
+  generate();
+}
+
+// ---------- Zeichnen ----------
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0b0f24'); g.addColorStop(0.6, '#2a1f4d'); g.addColorStop(1, '#7a3b5e');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  for (let i = 0; i < 80; i++) ctx.fillRect((hash(i) * W * 3 - cam.x * 0.02) % W, hash(i + 99) * H * 0.6, 1.5, 1.5);
+  ctx.fillStyle = '#f4ecc8'; ctx.beginPath(); ctx.arc(W * 0.8, H * 0.18, 46, 0, 7); ctx.fill();
+  // Parallax-Skyline
+  for (const [f, col, hmax] of [[0.15, '#1c1838', 0.45], [0.35, '#151230', 0.35]]) {
+    ctx.fillStyle = col;
+    const off = cam.x * f, step = 70;
+    for (let i = Math.floor(off / step) - 1; i < (off + W) / step + 1; i++) {
+      const h = (0.15 + hash(i * f) * hmax) * H;
+      ctx.fillRect(i * step - off, H - h - (cam.y + H) * f * 0.3, step - 6, h + 400);
+    }
+  }
+}
+
+function drawBuilding(b) {
+  const x = b.x - cam.x, y = -b.h - cam.y;
+  ctx.fillStyle = '#1a1a2e'; ctx.fillRect(x, y, b.w, b.h);
+  ctx.fillStyle = '#25254a'; ctx.fillRect(x, y, b.w, 8);
+  for (let wy = 24; wy < b.h - 20; wy += 34)
+    for (let wx = 14; wx < b.w - 20; wx += 28)
+      if (hash(b.seed + wx * 3 + wy * 7) > 0.45) {
+        ctx.fillStyle = hash(b.seed + wx + wy) > 0.7 ? '#ffd27a' : '#3b3f6e';
+        ctx.fillRect(x + wx, y + wy, 14, 18);
+      }
+}
+
+function drawSpidey() {
+  if (inv > 0 && Math.floor(inv / 5) % 2) return;
+  const x = p.x - cam.x, y = p.y - cam.y;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(p.rot); ctx.scale(p.face, 1);
+  const red = '#d6202b', blue = '#1e3fa8';
+  const swing = p.onGround ? Math.sin(p.x * 0.15) * 0.6 * Math.min(Math.abs(p.vx), 4) / 4 : 0.5;
+  ctx.lineCap = 'round'; ctx.lineWidth = 6;
+  // Beine
+  ctx.strokeStyle = blue;
+  [[swing, 1], [-swing, -1]].forEach(([a]) => { ctx.beginPath(); ctx.moveTo(0, 6); ctx.lineTo(Math.sin(a) * 14, 19); ctx.stroke(); });
+  // Körper
+  ctx.fillStyle = red; ctx.beginPath(); ctx.ellipse(0, -2, 8, 12, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = blue; ctx.fillRect(-8, 2, 16, 6);
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(-3, -2); ctx.lineTo(3, -2); ctx.closePath(); ctx.stroke();
+  // Arme
+  ctx.strokeStyle = red; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.moveTo(0, -6);
+  if (rope) { const a = Math.atan2(rope.y - p.y, (rope.x - p.x) * p.face) - p.rot * p.face; ctx.lineTo(Math.cos(a) * 16, -6 + Math.sin(a) * 16); }
+  else ctx.lineTo(10, 4);
+  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, -6); ctx.lineTo(-10, 2); ctx.stroke();
+  // Kopf mit Augen
+  ctx.fillStyle = red; ctx.beginPath(); ctx.arc(1, -19, 9, 0, 7); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.ellipse(5, -20, 3.2, 4.5, -0.5, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(-1.5, -20, 2.5, 4, 0.5, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawDrone(d) {
+  const x = d.x - cam.x, y = d.y - cam.y;
+  ctx.fillStyle = '#444b5a'; ctx.fillRect(x - 16, y - 7, 32, 14);
+  ctx.fillStyle = '#9aa'; ctx.fillRect(x - 24, y - 12, 14, 3); ctx.fillRect(x + 10, y - 12, 14, 3);
+  ctx.fillStyle = Math.sin(d.t * 8) > 0 ? '#ff2e2e' : '#a00';
+  ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill();
+}
+
+function drawToken(t) {
+  const x = t.x - cam.x, y = t.y - cam.y + Math.sin(t.t) * 6, s = Math.abs(Math.cos(t.t * 0.7));
+  ctx.fillStyle = '#ffd84a'; ctx.beginPath(); ctx.ellipse(x, y, 10 * s + 2, 10, 0, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#b8860b'; ctx.lineWidth = 2; ctx.stroke();
+}
+
+function text(str, x, y, size, col = '#fff', align = 'center') {
+  ctx.font = `800 ${size}px system-ui, sans-serif`; ctx.textAlign = align;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillText(str, x + 2, y + 2);
+  ctx.fillStyle = col; ctx.fillText(str, x, y);
+}
+
+function draw() {
+  drawSky();
+  if (!p) return;
+  buildings.forEach(drawBuilding);
+  ctx.fillStyle = '#0d0d18'; ctx.fillRect(0, -cam.y, W, H);
+  tokens.forEach(t => !t.got && drawToken(t));
+  drones.forEach(d => !d.dead && drawDrone(d));
+  if (rope) {
+    ctx.strokeStyle = '#f0f0f0'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(p.x - cam.x, p.y - cam.y - 6); ctx.lineTo(rope.x - cam.x, rope.y - cam.y); ctx.stroke();
+    ctx.beginPath(); ctx.arc(rope.x - cam.x, rope.y - cam.y, 4, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+  } else if (state === 'play') {
+    // Zielhilfe: zeigt, ob ein Netz an der Mausposition halten würde
+    const dx = mouse.x + cam.x - p.x, dy = mouse.y + cam.y - p.y, l = Math.hypot(dx, dy) || 1;
+    const hit = raycast(p.x, p.y, dx / l, dy / l);
+    ctx.strokeStyle = hit && hit.y < p.y + 10 ? 'rgba(120,255,160,0.35)' : 'rgba(255,255,255,0.12)';
+    ctx.setLineDash([4, 8]); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(p.x - cam.x, p.y - cam.y);
+    ctx.lineTo(p.x - cam.x + dx / l * ROPE_MAX, p.y - cam.y + dy / l * ROPE_MAX); ctx.stroke(); ctx.setLineDash([]);
+  }
+  drawSpidey();
+  particles.forEach(q => { ctx.globalAlpha = Math.min(1, q.life / 20); ctx.fillStyle = q.c; ctx.fillRect(q.x - cam.x - 2, q.y - cam.y - 2, 4, 4); });
+  ctx.globalAlpha = 1;
+
+  text(`Punkte: ${total()}`, 20, 40, 26, '#fff', 'left');
+  text('❤'.repeat(Math.max(lives, 0)), 20, 72, 24, '#ff4d5a', 'left');
+  text(`Rekord: ${best}`, W - 20, 40, 18, '#ccd', 'right');
+
+  if (state === 'menu' || state === 'over') {
+    ctx.fillStyle = 'rgba(5,5,20,0.7)'; ctx.fillRect(0, 0, W, H);
+    text(state === 'menu' ? 'SPIDER-SWING' : 'GAME OVER', W / 2, H / 2 - 90, Math.min(72, W / 9), '#e8303c');
+    if (state === 'over') text(`Punkte: ${total()}  ·  Rekord: ${best}`, W / 2, H / 2 - 40, 24);
+    const lines = ['Klicken / Leertaste: Netz schießen (loslassen = Netz lösen)',
+      'A/D: Schwung holen · W/S: Netz einziehen/verlängern · W: Springen',
+      'Gegen eine Wand laufen = hochklettern · W an der Wand = Wandsprung',
+      'Münzen sammeln · Drohnen nur mit hohem Tempo rammen!'];
+    lines.forEach((l, i) => text(l, W / 2, H / 2 + i * 30, Math.min(18, W / 40), '#dde'));
+    text('Klicken oder Enter zum Starten', W / 2, H / 2 + 130, 24, '#ffd84a');
+  }
+}
+
+// ---------- Eingabe ----------
+const start = () => { reset(); state = 'play'; };
+cv.addEventListener('pointerdown', e => {
+  mouse.x = e.clientX; mouse.y = e.clientY;
+  if (state !== 'play') return start();
+  shootWeb(e.clientX + cam.x, e.clientY + cam.y);
+});
+cv.addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+addEventListener('pointerup', () => { rope = null; });
+addEventListener('keydown', e => {
+  if (keys[e.code]) return;
+  keys[e.code] = true;
+  if (state !== 'play' && (e.code === 'Enter' || e.code === 'Space')) return start();
+  if (e.code === 'Space') autoWeb();
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; if (e.code === 'Space') rope = null; });
+
+reset();
+(function loop() { update(); draw(); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
